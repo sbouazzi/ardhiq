@@ -314,7 +314,6 @@ async def analyze_form(
 
     return resp
 
-
 @app.post("/api/analyze_json", response_model=AnalyzeResponse)
 def analyze_json(req: AnalyzeRequest, db: Session = Depends(get_db)) -> AnalyzeResponse:
     system_prompt = _load_system_prompt()
@@ -351,81 +350,143 @@ After the bilingual markdown report, append ONE JSON code block in this exact fo
     "viability_indicators": 0,
     "risk_assessment": 0
   }}
-}}Use null for unknown fields. Numbers must be numbers.
+}}
+Use null for unknown fields. Numbers must be numbers.
 
 Offer text:
 {offer_text}
 
 """.format(
-offer_text=req.offer_text.strip()
-)if req.user_context:
-    user_msg += "\nBuyer context (optional):\n---\n{ctx}\n---\n".format(ctx=req.user_context.strip())
-
-offer_text = req.offer_text.strip()
-user_context = req.user_context.strip() if req.user_context else None
-
-report = ""
-total = None
-breakdown = None
-report_ar = None
-report_fr = None
-extracted_override = None
-
-status = "ok"
-error_code = None
-error_message = None
-
-model_used = MODEL
-input_tokens = None
-output_tokens = None
-total_tokens = None
-
-try:
-    resp = client.responses.create(
-        model=MODEL,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.2,
+        offer_text=req.offer_text.strip()
     )
 
-    model_used = getattr(resp, "model", None) or MODEL
-    usage = getattr(resp, "usage", None)
-    if usage is not None:
-        input_tokens = getattr(usage, "input_tokens", None)
-        output_tokens = getattr(usage, "output_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
+    if req.user_context:
+        user_msg += "\nBuyer context (optional):\n---\n{ctx}\n---\n".format(
+            ctx=req.user_context.strip()
+        )
 
-    report = getattr(resp, "output_text", None) or ""
-    print("RAW MODEL OUTPUT:", repr(report[:2000]))
+    offer_text = req.offer_text.strip()
+    user_context = req.user_context.strip() if req.user_context else None
 
-    parsed = _extract_json_block(report)
+    report = ""
+    total = None
+    breakdown = None
+    report_ar = None
+    report_fr = None
     extracted_override = None
-    if isinstance(parsed, dict):
-        extracted_override = {
-            "location_text": parsed.get("location_text"),
-            "area_ha": parsed.get("area_ha"),
-            "price_tnd": parsed.get("price_tnd"),
-            "price_per_m2_tnd": parsed.get("price_per_m2_tnd"),
-            "water_source": parsed.get("water_source"),
-            "water_depth_m": parsed.get("water_depth_m"),
-            "tree_type": parsed.get("tree_type"),
-            "tree_count": parsed.get("tree_count"),
-            "short_summary": parsed.get("short_summary"),
-        }
-        if isinstance(parsed.get("score_breakdown"), dict):
-            breakdown = parsed.get("score_breakdown")
-        if parsed.get("score_total") is not None:
-            try:
-                total = int(parsed.get("score_total"))
-            except Exception:
-                pass
 
-except Exception as e:
-    status = "error"
-    error_code = "openai_error"
-    error_message = str(e)[:500]
+    status = "ok"
+    error_code = None
+    error_message = None
+
+    model_used = MODEL
+    input_tokens = None
+    output_tokens = None
+    total_tokens = None
+
+    try:
+        resp = client.responses.create(
+            model=MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+        )
+
+        model_used = getattr(resp, "model", None) or MODEL
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            input_tokens = getattr(usage, "input_tokens", None)
+            output_tokens = getattr(usage, "output_tokens", None)
+            total_tokens = getattr(usage, "total_tokens", None)
+
+        report = getattr(resp, "output_text", None) or ""
+        print("RAW MODEL OUTPUT:", repr(report[:2000]))
+
+        parsed = _extract_json_block(report)
+        if isinstance(parsed, dict):
+            extracted_override = {
+                "location_text": parsed.get("location_text"),
+                "area_ha": parsed.get("area_ha"),
+                "price_tnd": parsed.get("price_tnd"),
+                "price_per_m2_tnd": parsed.get("price_per_m2_tnd"),
+                "water_source": parsed.get("water_source"),
+                "water_depth_m": parsed.get("water_depth_m"),
+                "tree_type": parsed.get("tree_type"),
+                "tree_count": parsed.get("tree_count"),
+                "short_summary": parsed.get("short_summary"),
+            }
+            if isinstance(parsed.get("score_breakdown"), dict):
+                breakdown = parsed.get("score_breakdown")
+            if parsed.get("score_total") is not None:
+                try:
+                    total = int(parsed.get("score_total"))
+                except Exception:
+                    pass
+
+    except Exception as e:
+        status = "error"
+        error_code = "openai_error"
+        error_message = str(e)[:500]
+
+        saved = create_analysis(
+            db,
+            offer_text=offer_text,
+            image_path=None,
+            user_context=user_context,
+            report_markdown=report,
+            report_ar_md=None,
+            report_fr_md=None,
+            score_total=None,
+            breakdown=None,
+            model=MODEL,
+            prompt_version="spec-v1",
+            status=status,
+            error_code=error_code,
+            error_message=error_message,
+            model_used=model_used,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+
+        return AnalyzeResponse(
+            report_markdown=report,
+            report_ar_markdown=None,
+            report_fr_markdown=None,
+            score_total=None,
+            score_breakdown=None,
+            status=status,
+            error_code=error_code,
+            error_message=error_message,
+            analysis_id=saved.id,
+        )
+
+    try:
+        if total is None or breakdown is None:
+            t2, b2 = _extract_scores(report)
+            total = total if total is not None else t2
+            breakdown = breakdown if breakdown is not None else b2
+
+        report_ar, report_fr = _split_bilingual_report(report)
+
+        if report_ar is None and report_fr is None:
+            report_ar = report or "No analysis text returned."
+            report_fr = None
+            status = "error"
+            error_code = "parse_error"
+            error_message = "Bilingual markers not found"
+
+    except Exception as e:
+        status = "error"
+        error_code = "parse_error"
+        error_message = str(e)[:500]
+
+        if not report_ar:
+            report_ar = report or "No analysis text returned."
+        if not report_fr:
+            report_fr = None
 
     saved = create_analysis(
         db,
@@ -433,12 +494,13 @@ except Exception as e:
         image_path=None,
         user_context=user_context,
         report_markdown=report,
-        report_ar_md=None,
-        report_fr_md=None,
-        score_total=None,
-        breakdown=None,
+        report_ar_md=report_ar,
+        report_fr_md=report_fr,
+        score_total=total,
+        breakdown=breakdown,
         model=MODEL,
         prompt_version="spec-v1",
+        extracted_override=extracted_override,
         status=status,
         error_code=error_code,
         error_message=error_message,
@@ -450,71 +512,12 @@ except Exception as e:
 
     return AnalyzeResponse(
         report_markdown=report,
-        report_ar_markdown=None,
-        report_fr_markdown=None,
-        score_total=None,
-        score_breakdown=None,
+        report_ar_markdown=report_ar,
+        report_fr_markdown=report_fr,
+        score_total=total,
+        score_breakdown=breakdown,
         status=status,
         error_code=error_code,
         error_message=error_message,
         analysis_id=saved.id,
     )
-
-try:
-    if total is None or breakdown is None:
-        t2, b2 = _extract_scores(report)
-        total = total if total is not None else t2
-        breakdown = breakdown if breakdown is not None else b2
-
-    report_ar, report_fr = _split_bilingual_report(report)
-
-    if report_ar is None and report_fr is None:
-        report_ar = report or "No analysis text returned."
-        report_fr = None
-        status = "error"
-        error_code = "parse_error"
-        error_message = "Bilingual markers not found"
-
-except Exception as e:
-    status = "error"
-    error_code = "parse_error"
-    error_message = str(e)[:500]
-
-    if not report_ar:
-        report_ar = report or "No analysis text returned."
-    if not report_fr:
-        report_fr = None
-
-saved = create_analysis(
-    db,
-    offer_text=offer_text,
-    image_path=None,
-    user_context=user_context,
-    report_markdown=report,
-    report_ar_md=report_ar,
-    report_fr_md=report_fr,
-    score_total=total,
-    breakdown=breakdown,
-    model=MODEL,
-    prompt_version="spec-v1",
-    extracted_override=extracted_override,
-    status=status,
-    error_code=error_code,
-    error_message=error_message,
-    model_used=model_used,
-    input_tokens=input_tokens,
-    output_tokens=output_tokens,
-    total_tokens=total_tokens,
-)
-
-return AnalyzeResponse(
-    report_markdown=report,
-    report_ar_markdown=report_ar,
-    report_fr_markdown=report_fr,
-    score_total=total,
-    score_breakdown=breakdown,
-    status=status,
-    error_code=error_code,
-    error_message=error_message,
-    analysis_id=saved.id,
-)
