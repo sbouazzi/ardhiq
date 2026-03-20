@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -273,49 +273,7 @@ def analysis_detail(analysis_id: str, db: Session = Depends(get_db)) -> Analysis
     )
 
 
-@app.post("/api/analyze", response_model=AnalyzeResponse)
-async def analyze_form(
-    offer_text: str | None = Form(default=None),
-    user_context: str | None = Form(default=None),
-    image: UploadFile | None = File(default=None),
-    db: Session = Depends(get_db),
-) -> AnalyzeResponse:
-    # Save optional image and OCR it.
-    ocr_text = None
-    saved_path = None
-    if image is not None:
-        suffix = Path(image.filename or "upload").suffix or ".png"
-        fname = f"{os.urandom(8).hex()}{suffix}"
-        saved_path = UPLOAD_DIR / fname
-        content = await image.read()
-        saved_path.write_bytes(content)
-        ocr_text = _ocr_image_to_text(saved_path)
-
-    combined = "\n\n".join([t.strip() for t in [offer_text or "", ocr_text or ""] if t and t.strip()]).strip()
-    if not combined:
-        raise HTTPException(status_code=400, detail="No offer text found (paste text or upload a screenshot).")
-
-    req = AnalyzeRequest(offer_text=combined, user_context=user_context)
-    # Reuse the JSON handler logic.
-    resp = analyze_json(req, db=db)
-
-    # Patch image_path on the saved record (create_analysis stores it).
-    if saved_path and resp.analysis_id:
-        # This is best-effort; if anything fails, the analysis still exists.
-        try:
-            from app.models.analysis import Analysis
-
-            row = db.query(Analysis).filter(Analysis.id == resp.analysis_id).first()
-            if row:
-                row.image_path = str(saved_path.relative_to(REPO_ROOT))
-                db.commit()
-        except Exception:
-            pass
-
-    return resp
-
-@app.post("/api/analyze_json", response_model=AnalyzeResponse)
-def analyze_json(req: AnalyzeRequest, db: Session = Depends(get_db)) -> AnalyzeResponse:
+def _run_analysis(req: AnalyzeRequest, db: Session) -> AnalyzeResponse:
     system_prompt = _load_system_prompt()
 
     user_msg = """Analyze this Tunisia land offer using the ArdhIQ spec.
@@ -521,3 +479,64 @@ Offer text:
         error_message=error_message,
         analysis_id=saved.id,
     )
+
+@app.post("/api/analyze", response_model=AnalyzeResponse)
+async def analyze(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> AnalyzeResponse:
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body.")
+
+        try:
+            req = AnalyzeRequest.model_validate(payload)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        return _run_analysis(req, db)
+
+    form = await request.form()
+    offer_text = str(form.get("offer_text") or "")
+    user_context_raw = form.get("user_context")
+    user_context = str(user_context_raw).strip() if user_context_raw is not None else None
+    image = form.get("image")
+
+    ocr_text = None
+    saved_path = None
+    if image is not None and hasattr(image, "read"):
+        suffix = Path(getattr(image, "filename", None) or "upload").suffix or ".png"
+        fname = f"{os.urandom(8).hex()}{suffix}"
+        saved_path = UPLOAD_DIR / fname
+        content = await image.read()
+        saved_path.write_bytes(content)
+        ocr_text = _ocr_image_to_text(saved_path)
+
+    combined = "\n\n".join([t.strip() for t in [offer_text, ocr_text or ""] if t and t.strip()]).strip()
+    if not combined:
+        raise HTTPException(status_code=400, detail="No offer text found (paste text or upload a screenshot).")
+
+    req = AnalyzeRequest(offer_text=combined, user_context=user_context)
+    resp = _run_analysis(req, db)
+
+    if saved_path and resp.analysis_id:
+        try:
+            from app.models.analysis import Analysis
+
+            row = db.query(Analysis).filter(Analysis.id == resp.analysis_id).first()
+            if row:
+                row.image_path = str(saved_path.relative_to(REPO_ROOT))
+                db.commit()
+        except Exception:
+            pass
+
+    return resp
+
+
+@app.post("/api/analyze_json", response_model=AnalyzeResponse)
+def analyze_json(req: AnalyzeRequest, db: Session = Depends(get_db)) -> AnalyzeResponse:
+    return _run_analysis(req, db)
